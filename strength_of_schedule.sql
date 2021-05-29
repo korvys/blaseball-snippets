@@ -53,5 +53,5 @@ sos as (
 	join opp_opp_record oor on r.team_id = oor.team_id
 	order by sos desc
 )
-select avg(sos)
+select *
 from sos
