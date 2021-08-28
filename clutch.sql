@@ -7,6 +7,7 @@ with game_events_extra as (
 			ge.event_text,
 			ge.batter_id,
 			ge.inning,
+			(case when ge.inning >= 8 then 8 else ge.inning end) as inning_extra,
 			ge.top_of_inning,
 			ceiling(case when ge.top_of_inning then ge.away_score - ge.home_score else ge.home_score - ge.away_score end) as before_run_diff,
 			-- Not sure about using ceiling here. For decimal score diffs, if you're ahead it rounds up, but if you're behind it rounds down.
@@ -44,14 +45,14 @@ WE_matrix as (
 			gee.outs_during_inning, 
 			gee.base_count, 
 			gee.before_run_diff,
-			gee.inning,
+			gee.inning_extra,
 			gee.top_of_inning,
 			avg(gee.game_winning) as WE, 
 			count(*) as event_count
 	from game_events_extra gee
 	where 1=1
-	group by gee.outs_before_play, gee.bases_before_play, gee.outs_during_inning, gee.base_count, gee.before_run_diff, gee.inning, gee.top_of_inning
-	order by gee.outs_during_inning, gee.base_count, outs, bases, gee.before_run_diff, gee.inning, gee.top_of_inning
+	group by gee.outs_before_play, gee.bases_before_play, gee.outs_during_inning, gee.base_count, gee.before_run_diff, gee.inning_extra, gee.top_of_inning
+	order by gee.outs_during_inning, gee.base_count, outs, bases, gee.before_run_diff, gee.inning_extra, gee.top_of_inning
 ),
 -- Only modified up to here for the WE/WPA/LI/Clutch stuff, so far.
 --
