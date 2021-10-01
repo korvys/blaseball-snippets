@@ -1,7 +1,8 @@
 -- TODO:
 --		Fix GAME_OVER events, which currently have the same state as the beginning of the final inning, confusing the WE stuff
 --		Filter out non-batting events from various parts of the calculations
---		Figure out why WPA calculation gives NULL for some players
+--		Group run diffs of +11 together 
+--		Filter our rare states (>4 bases, more than 3 outs, etc)
 --
 -- This is the list of all events we're looking to use, with extra info we need to calculate stuff later
 with game_events_extra as (
@@ -68,6 +69,7 @@ WE_matrix as (
 			gee.state_run_diff
 
 ),
+-- Join each event to the following event, and use the matrix to look at the WE for each, and the change (WPA)
 game_events_WE as (
 	select 	gee_before.id,
 			gee_before.game_id,
@@ -79,7 +81,7 @@ game_events_WE as (
 
 			we_before.WE as before_WE,
 			we_after.WE as after_WE,
-			trunc(coalesce(we_after.WE-we_before.WE, 0), 4) as swing,
+			coalesce(we_after.WE-we_before.WE, 0) as wpa,
 			
 			gee_before.state_outs_during_inning,
 			gee_before.state_base_count,
@@ -114,6 +116,7 @@ game_events_WE as (
 			and gee_after.state_baserunners = we_after.state_baserunners 
 			and gee_after.state_run_diff = we_after.state_run_diff
 ),
+-- Determine the average change in WE for each state (swing).
 leverage as (
 	select	gew.state_outs_during_inning, 
 			gew.state_base_count, 
@@ -122,7 +125,7 @@ leverage as (
 			gew.state_before_outs, 
 			gew.state_before_baserunners, 
 			gew.state_before_run_diff,
-			avg(abs(gew.swing)) as leverage, 
+			avg(abs(gew.wpa)) as swing, 
 			count(*) as event_count
 	from game_events_WE gew
 	where 1=1
@@ -144,20 +147,58 @@ leverage as (
 			gew.state_before_baserunners, 
 			gew.state_before_run_diff
 ),
+-- Determine the average swing for any state. Used to normalise all swings to an average of 1, as Leverage Index (LI)
+leverage_ref as (
+	select avg(abs(gew.wpa)) as l_baseline
+	from game_events_WE gew
+),
+-- Add the leverage information to each event, and the WPA/LI (WPA, normalised by the LI of the event, also called "Context Neutral Wins")
+game_events_WELI as (
+	select 	gew.*,
+			l.swing,
+			lr.l_baseline,
+			l.swing/lr.l_baseline as LI,
+			coalesce(gew.WPA/NULLIF(l.swing/lr.l_baseline, 0), 0) as wpa_li
+	from game_events_we gew
+	join leverage l
+		on	gew.state_outs_during_inning = l.state_outs_during_inning 
+		and	gew.state_base_count = l.state_base_count
+		and gew.state_before_inning = l.state_before_inning
+		and	gew.state_before_top_of_inning = l.state_before_top_of_inning
+		and gew.state_before_outs = l.state_before_outs 
+		and gew.state_before_baserunners = l.state_before_baserunners 
+		and gew.state_before_run_diff = l.state_before_run_diff
+	cross join leverage_ref lr 
+),
+-- Join the data to the players.
+-- Since all WPA is calculated from the POV of the Home team, summing needs to be flipped depending on Batter or Pitching in the Top or Bottom of the inning.
 player_WPA as (
 	select 	p.player_id, 
 			p.player_name,
-			gew.season,
-			sum(gew.swing) filter (where (not gew.state_before_top_of_inning and gew.batter_id = p.player_id) or (gew.state_before_top_of_inning and gew.pitcher_id = p.player_id))
-			-sum(gew.swing) filter (where (gew.state_before_top_of_inning and gew.batter_id = p.player_id) or (not gew.state_before_top_of_inning and gew.pitcher_id = p.player_id)) as WPA,
+			--gew.season,
+			coalesce(sum(gew.wpa) filter (where ((not gew.state_before_top_of_inning) and gew.batter_id = p.player_id) or (gew.state_before_top_of_inning and gew.pitcher_id = p.player_id)), 0)
+			-coalesce(sum(gew.wpa) filter (where (gew.state_before_top_of_inning and gew.batter_id = p.player_id) or (not gew.state_before_top_of_inning and gew.pitcher_id = p.player_id)), 0) as WPA,
+			avg(gew.li) as pLI,
+			coalesce(sum(gew.wpa_li)	filter (where (not gew.state_before_top_of_inning and gew.batter_id = p.player_id) or (gew.state_before_top_of_inning and gew.pitcher_id = p.player_id)), 0)
+			-coalesce(sum(gew.wpa_li) filter (where (gew.state_before_top_of_inning and gew.batter_id = p.player_id) or (not gew.state_before_top_of_inning and gew.pitcher_id = p.player_id)), 0) as wpa_li,
 			count(*) as event_count
 	from data.players p
-	join game_events_WE gew on ((gew.batter_id = p.player_id or gew.pitcher_id = p.player_id)) and p.valid_until is null
-	group by p.player_id, p.player_name, gew.season
+	join game_events_WELI gew on ((gew.batter_id = p.player_id or gew.pitcher_id = p.player_id)) and p.valid_until is null
+	group by p.player_id, p.player_name--, gew.season
 )
--- Only modified up to here for the WE/WPA/LI/Clutch stuff, so far.
---
------- List requested data
-select *
-from player_WPA
-order by WPA desc
+
+-- List requested data
+select 	--p.*
+		p.player_id, 
+		p.player_name,
+		--p.season+1 as season,
+		trunc(coalesce(p.wpa, 0), 4) as wpa,
+		trunc(p.pli, 4) as pli,
+		trunc(p.wpa_li, 4) as "wpa/li",
+		trunc(coalesce(p.wpa/nullif(p.pli, 0), 0)-p.wpa_li, 4) as clutch,
+		-- ^ this nonsense is to prevent div/0 when the swing for some event is 0, causing the pli to be 0.
+		p.event_count		
+from player_WPA p
+order by clutch desc
+
+
